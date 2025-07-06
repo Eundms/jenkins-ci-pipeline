@@ -1,0 +1,140 @@
+pipeline {
+    agent any
+
+    tools {
+        gradle 'gradle-8.2.1'
+        jdk 'jdk-17.0.2'
+    }
+
+    parameters {
+        choice(choices: ['dev', 'staging', 'prod'], name: 'PROFILE', description: '배포 환경 선택')
+        string(name: 'DOCKERHUB_USERNAME', defaultValue: '', description: 'DockerHub 사용자명')
+        string(name: 'GITHUB_USERNAME', defaultValue: '', description: 'GitHub 사용자명')
+        string(name: 'GITHUB_EMAIL', defaultValue: '', description: 'GitHub 이메일')
+    }
+
+    environment {
+        APP_NAME = 'vvue-be'
+    }
+
+    stages {
+
+        stage('Check Parameters') {
+            steps {
+                script {
+                    if (!params.DOCKERHUB_USERNAME?.trim() || !params.GITHUB_USERNAME?.trim() || !params.GITHUB_EMAIL?.trim()) {
+                        error "필수 파라미터(DOCKERHUB_USERNAME, GITHUB_USERNAME, GITHUB_EMAIL)를 입력해 주세요."
+                    }
+                }
+            }
+        }
+
+        stage('App Source Checkout') {
+            steps {
+                git branch: 'master', url: 'https://github.com/Eundms/vvue-be-refactoring.git'
+            }
+        }
+        
+
+        stage('Gradle Build') {
+            steps {
+                sh "chmod +x ./gradlew"
+                sh "./gradlew clean build -x test -Dspring.profiles.active=${params.PROFILE}"
+            }
+        }
+
+        stage('Set Version Tag') {
+            steps {
+                script {
+                    def date = sh(script: "date +%y%m%d.%H%M%S", returnStdout: true).trim()
+                    def appVersion = sh(script: "./gradlew properties -q | grep '^version:' | awk '{print \$2}'", returnStdout: true).trim()
+
+                    env.BUILD_DATE = date
+                    env.APP_VERSION = appVersion
+                    env.TAG = "${env.APP_NAME}-${appVersion}-${params.PROFILE}-${date}"
+                }
+            }
+        }
+
+        stage('Dockerfile Sparse Checkout') {
+            steps {
+                dir('dockerfile-source') {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/master']],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [[
+                            $class: 'SparseCheckoutPaths',
+                            sparseCheckoutPaths: [[path: "${APP_NAME}/build/docker"]]
+                        ]],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/Eundms/jenkins-ci-pipeline.git'
+                        ]]
+                    ])
+                }
+            }
+        }
+
+
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    def jarPath = sh(
+                        script: "ls build/libs/*.jar | head -n 1",
+                        returnStdout: true
+                    ).trim()
+                    def dockerPath = "dockerfile-source/${APP_NAME}/build/docker" 
+
+                    // JAR 복사
+                    sh "cp ${jarPath} ${dockerPath}/app.jar"
+
+                    // DockerHub 로그인
+                    withCredentials([usernamePassword(credentialsId: 'docker_password', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                        sh '''echo "$PASSWORD" | docker login -u "$USERNAME" --password-stdin'''
+                    }
+
+                    // Docker 빌드 및 푸시
+                    sh "docker build --build-arg IDLE_PROFILE=${params.PROFILE} ${dockerPath} -t ${DOCKERHUB_USERNAME}/${APP_NAME}:${TAG}"
+                    sh "docker push ${DOCKERHUB_USERNAME}/${APP_NAME}:${TAG}"
+                    sh "docker rmi ${DOCKERHUB_USERNAME}/${APP_NAME}:${TAG}"
+                }
+            }
+
+            post {
+                always {
+                    sh "docker logout"
+                }
+            }
+        }
+
+        stage('GitOps 저장소에 태그 업데이트') {
+            steps {
+                dir('k8s-gitops') {
+                    git branch: 'master', url: "https://github.com/Eundms/k8s-gitops.git"
+                }
+
+                script {
+                    def valuesFile = "k8s-gitops/apps/${APP_NAME}/${params.PROFILE}/values.yaml"
+
+                    sh """
+                        sed -i 's|^  repository:.*|  repository: ${DOCKERHUB_USERNAME}/${APP_NAME}|' ${valuesFile}
+                        sed -i 's|^  tag:.*|  tag: "${TAG}"|' ${valuesFile}
+                    """
+
+                    withCredentials([usernamePassword(credentialsId: 'github_token', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                        sh '''#!/bin/bash
+                            cd k8s-gitops
+                            git config user.email "$GITHUB_EMAIL"
+                            git config user.name "$GITHUB_USERNAME"
+                            git remote set-url origin https://$USERNAME:$PASSWORD@github.com/Eundms/k8s-gitops.git
+                            git add apps/${APP_NAME}/overlays/${PROFILE}/values.yaml
+                            git commit -m "update $APP_NAME:$TAG for $PROFILE"
+                            git push origin HEAD:master
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
